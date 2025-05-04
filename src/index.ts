@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { randomUUID } from "node:crypto";
+import express from "express";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js"
 import {
     CallToolRequestSchema,
     ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+
 import { google } from 'googleapis';
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
@@ -16,7 +21,7 @@ import { fileURLToPath } from 'url';
 import http from 'http';
 import open from 'open';
 import os from 'os';
-import {createEmailMessage} from "./utl.js";
+import { createEmailMessage } from "./utl.js";
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -95,7 +100,7 @@ function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
 async function loadCredentials() {
     try {
         // Create config directory if it doesn't exist
-        if (!process.env.GMAIL_OAUTH_PATH && !CREDENTIALS_PATH &&!fs.existsSync(CONFIG_DIR)) {
+        if (!process.env.GMAIL_OAUTH_PATH && !CREDENTIALS_PATH && !fs.existsSync(CONFIG_DIR)) {
             fs.mkdirSync(CONFIG_DIR, { recursive: true });
         }
 
@@ -122,9 +127,9 @@ async function loadCredentials() {
             process.exit(1);
         }
 
-        const callback = process.argv[2] === 'auth' && process.argv[3] 
-        ? process.argv[3] 
-        : "http://localhost:3000/oauth2callback";
+        const callback = process.argv[2] === 'auth' && process.argv[3]
+            ? process.argv[3]
+            : "http://localhost:3000/oauth2callback";
 
         oauth2Client = new OAuth2Client(
             keys.client_id,
@@ -183,6 +188,240 @@ async function authenticate() {
                 reject(error);
             }
         });
+    });
+}
+
+// --- MCP Tool registrations ---
+function registerGmailTools(server: McpServer, gmail: any) {
+
+    server.tool("send_email", SendEmailSchema.shape, async (args) => {
+        const message = createEmailMessage(args);
+        const encodedMessage = Buffer.from(message).toString('base64')
+            .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        const req: { raw: string, threadId?: string } = { raw: encodedMessage };
+        if (args.threadId) req.threadId = args.threadId;
+        const res = await gmail.users.messages.send({
+            userId: 'me', requestBody: req,
+        });
+        return { content: [{ type: "text", text: `Email sent successfully with ID: ${res.data.id}` }] };
+    });
+
+    server.tool("draft_email", SendEmailSchema.shape, async (args) => {
+        const message = createEmailMessage(args);
+        const encodedMessage = Buffer.from(message).toString('base64')
+            .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        const req: { raw: string, threadId?: string } = { raw: encodedMessage };
+        if (args.threadId) req.threadId = args.threadId;
+        const res = await gmail.users.drafts.create({
+            userId: 'me', requestBody: { message: req },
+        });
+        return { content: [{ type: "text", text: `Email draft created successfully with ID: ${res.data.id}` }] };
+    });
+
+    server.tool("read_email", ReadEmailSchema.shape, async (args) => {
+        const res = await gmail.users.messages.get({
+            userId: 'me', id: args.messageId, format: 'full',
+        });
+
+        const headers = res.data.payload?.headers || [];
+        const subject = headers.find((h: { name: string; }) => h.name?.toLowerCase() === 'subject')?.value || '';
+        const from = headers.find((h: { name: string; }) => h.name?.toLowerCase() === 'from')?.value || '';
+        const to = headers.find((h: { name: string; }) => h.name?.toLowerCase() === 'to')?.value || '';
+        const date = headers.find((h: { name: string; }) => h.name?.toLowerCase() === 'date')?.value || '';
+        const threadId = res.data.threadId || '';
+        const { text, html } = extractEmailContent(res.data.payload as GmailMessagePart || {});
+        const body = text || html || '';
+        const contentTypeNote = !text && html ? '[Note: This email is HTML-formatted. Plain text version not available.]\n\n' : '';
+        const attachments: EmailAttachment[] = [];
+        const processAttachmentParts = (part: GmailMessagePart, path: string = '') => {
+            if (part.body && part.body.attachmentId) {
+                const filename = part.filename || `attachment-${part.body.attachmentId}`;
+                attachments.push({
+                    id: part.body.attachmentId, filename: filename,
+                    mimeType: part.mimeType || 'application/octet-stream',
+                    size: part.body.size || 0
+                });
+            }
+            if (part.parts) {
+                part.parts.forEach((subpart: GmailMessagePart) =>
+                    processAttachmentParts(subpart, `${path}/parts`));
+            }
+        };
+        if (res.data.payload) processAttachmentParts(res.data.payload as GmailMessagePart);
+        const attachmentInfo = attachments.length > 0
+            ? `\n\nAttachments (${attachments.length}):\n` +
+            attachments.map(a => `- ${a.filename} (${a.mimeType}, ${Math.round(a.size / 1024)} KB)`).join('\n') : '';
+        return {
+            content: [{
+                type: "text", text:
+                    `Thread ID: ${threadId}\nSubject: ${subject}\nFrom: ${from}\nTo: ${to}\nDate: ${date}\n\n${contentTypeNote}${body}${attachmentInfo}`
+            }]
+        };
+    });
+
+    server.tool("search_emails", SearchEmailsSchema.shape, async (args) => {
+        const res = await gmail.users.messages.list({
+            userId: 'me',
+            q: args.query,
+            maxResults: args.maxResults || 10,
+        });
+        const messages = res.data.messages || [];
+        const results = await Promise.all(
+            messages.map(async (msg: { id: any; }) => {
+                const detail = await gmail.users.messages.get({
+                    userId: 'me',
+                    id: msg.id!,
+                    format: 'metadata',
+                    metadataHeaders: ['Subject', 'From', 'Date'],
+                });
+                const headers = detail.data.payload?.headers || [];
+                return {
+                    id: msg.id,
+                    subject: headers.find((h: { name: string; }) => h.name === 'Subject')?.value || '',
+                    from: headers.find((h: { name: string; }) => h.name === 'From')?.value || '',
+                    date: headers.find((h: { name: string; }) => h.name === 'Date')?.value || '',
+                };
+            })
+        );
+        return {
+            content: [{
+                type: "text",
+                text: results.map(r => `ID: ${r.id}\nSubject: ${r.subject}\nFrom: ${r.from}\nDate: ${r.date}\n`).join('\n'),
+            }]
+        };
+    });
+
+    server.tool("modify_email", ModifyEmailSchema.shape, async (args) => {
+        const requestBody: any = {};
+        if (args.labelIds) requestBody.addLabelIds = args.labelIds;
+        if (args.addLabelIds) requestBody.addLabelIds = args.addLabelIds;
+        if (args.removeLabelIds) requestBody.removeLabelIds = args.removeLabelIds;
+        await gmail.users.messages.modify({
+            userId: 'me',
+            id: args.messageId,
+            requestBody: requestBody,
+        });
+        return {
+            content: [{ type: "text", text: `Email ${args.messageId} labels updated successfully` }]
+        };
+    });
+
+    server.tool("delete_email", DeleteEmailSchema.shape, async (args) => {
+        await gmail.users.messages.delete({
+            userId: 'me',
+            id: args.messageId,
+        });
+        return {
+            content: [{ type: "text", text: `Email ${args.messageId} deleted successfully` }]
+        };
+    });
+
+    server.tool("list_email_labels", ListEmailLabelsSchema.shape, async () => {
+        const labelResults = await listLabels(gmail);
+        const systemLabels = labelResults.system;
+        const userLabels = labelResults.user;
+        return {
+            content: [{
+                type: "text",
+                text: `Found ${labelResults.count.total} labels (${labelResults.count.system} system, ${labelResults.count.user} user):\n\n` +
+                    "System Labels:\n" +
+                    systemLabels.map((l: GmailLabel) => `ID: ${l.id}\nName: ${l.name}\n`).join('\n') +
+                    "\nUser Labels:\n" +
+                    userLabels.map((l: GmailLabel) => `ID: ${l.id}\nName: ${l.name}\n`).join('\n')
+            }]
+        };
+    });
+
+    // --- Batch tools helper ---
+    async function processBatches<T, U>(
+        items: T[], batchSize: number, processFn: (batch: T[]) => Promise<U[]>
+    ): Promise<{ successes: U[], failures: { item: T, error: Error }[] }> {
+        const successes: U[] = [], failures: { item: T, error: Error }[] = [];
+        for (let i = 0; i < items.length; i += batchSize) {
+            const batch = items.slice(i, i + batchSize);
+            try { successes.push(...await processFn(batch)); }
+            catch (error) {
+                for (const item of batch) {
+                    try { successes.push(...await processFn([item])); }
+                    catch (itemError) { failures.push({ item, error: itemError as Error }); }
+                }
+            }
+        }
+        return { successes, failures };
+    }
+
+    server.tool("batch_modify_emails", BatchModifyEmailsSchema.shape, async (args) => {
+        const requestBody: any = {};
+        if (args.addLabelIds) requestBody.addLabelIds = args.addLabelIds;
+        if (args.removeLabelIds) requestBody.removeLabelIds = args.removeLabelIds;
+        const { successes, failures } = await processBatches(
+            args.messageIds, args.batchSize || 50,
+            async (batch) => Promise.all(batch.map(async (messageId) => {
+                await gmail.users.messages.modify({
+                    userId: 'me', id: messageId, requestBody: requestBody,
+                });
+                return { messageId, success: true };
+            }))
+        );
+        let resultText = `Batch label modification complete.\nSuccessfully processed: ${successes.length} messages\n`;
+        if (failures.length > 0) {
+            resultText += `Failed to process: ${failures.length} messages\n\nFailed message IDs:\n` +
+                failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${f.error.message})`).join('\n');
+        }
+        return { content: [{ type: "text", text: resultText }] };
+    });
+
+    server.tool("batch_delete_emails", BatchDeleteEmailsSchema.shape, async (args) => {
+        const { successes, failures } = await processBatches(
+            args.messageIds, args.batchSize || 50,
+            async (batch) => Promise.all(batch.map(async (messageId) => {
+                await gmail.users.messages.delete({ userId: 'me', id: messageId });
+                return { messageId, success: true };
+            }))
+        );
+        let resultText = `Batch delete operation complete.\nSuccessfully deleted: ${successes.length} messages\n`;
+        if (failures.length > 0) {
+            resultText += `Failed to delete: ${failures.length} messages\n\nFailed message IDs:\n` +
+                failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${f.error.message})`).join('\n');
+        }
+        return { content: [{ type: "text", text: resultText }] };
+    });
+
+    server.tool("create_label", CreateLabelSchema.shape, async (args) => {
+        const result = await createLabel(gmail, args.name, {
+            messageListVisibility: args.messageListVisibility,
+            labelListVisibility: args.labelListVisibility,
+        });
+        return {
+            content: [{ type: "text", text: `Label created successfully:\nID: ${result.id}\nName: ${result.name}\nType: ${result.type}` }]
+        };
+    });
+
+    server.tool("update_label", UpdateLabelSchema.shape, async (args) => {
+        const updates: any = {};
+        if (args.name) updates.name = args.name;
+        if (args.messageListVisibility) updates.messageListVisibility = args.messageListVisibility;
+        if (args.labelListVisibility) updates.labelListVisibility = args.labelListVisibility;
+        const result = await updateLabel(gmail, args.id, updates);
+        return {
+            content: [{ type: "text", text: `Label updated successfully:\nID: ${result.id}\nName: ${result.name}\nType: ${result.type}` }]
+        };
+    });
+
+    server.tool("delete_label", DeleteLabelSchema.shape, async (args) => {
+        const result = await deleteLabel(gmail, args.id);
+        return { content: [{ type: "text", text: result.message }] };
+    });
+
+    server.tool("get_or_create_label", GetOrCreateLabelSchema.shape, async (args) => {
+        const result = await getOrCreateLabel(gmail, args.name, {
+            messageListVisibility: args.messageListVisibility,
+            labelListVisibility: args.labelListVisibility,
+        });
+        const action = result.type === 'user' && result.name === args.name ? 'found existing' : 'created new';
+        return {
+            content: [{ type: "text", text: `Successfully ${action} label:\nID: ${result.id}\nName: ${result.name}\nType: ${result.type}` }]
+        };
     });
 }
 
@@ -267,555 +506,169 @@ async function main() {
         console.log('Authentication completed successfully');
         process.exit(0);
     }
-
     // Initialize Gmail API
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
     // Server implementation
-    const server = new Server({
+    const server = new McpServer({
         name: "gmail",
         version: "1.0.0",
-        capabilities: {
-            tools: {},
-        },
+        capabilities: { tools: {} },
     });
 
-    // Tool handlers
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
-        tools: [
-            {
-                name: "send_email",
-                description: "Sends a new email",
-                inputSchema: zodToJsonSchema(SendEmailSchema),
-            },
-            {
-                name: "draft_email",
-                description: "Draft a new email",
-                inputSchema: zodToJsonSchema(SendEmailSchema),
-            },
-            {
-                name: "read_email",
-                description: "Retrieves the content of a specific email",
-                inputSchema: zodToJsonSchema(ReadEmailSchema),
-            },
-            {
-                name: "search_emails",
-                description: "Searches for emails using Gmail search syntax",
-                inputSchema: zodToJsonSchema(SearchEmailsSchema),
-            },
-            {
-                name: "modify_email",
-                description: "Modifies email labels (move to different folders)",
-                inputSchema: zodToJsonSchema(ModifyEmailSchema),
-            },
-            {
-                name: "delete_email",
-                description: "Permanently deletes an email",
-                inputSchema: zodToJsonSchema(DeleteEmailSchema),
-            },
-            {
-                name: "list_email_labels",
-                description: "Retrieves all available Gmail labels",
-                inputSchema: zodToJsonSchema(ListEmailLabelsSchema),
-            },
-            {
-                name: "batch_modify_emails",
-                description: "Modifies labels for multiple emails in batches",
-                inputSchema: zodToJsonSchema(BatchModifyEmailsSchema),
-            },
-            {
-                name: "batch_delete_emails",
-                description: "Permanently deletes multiple emails in batches",
-                inputSchema: zodToJsonSchema(BatchDeleteEmailsSchema),
-            },
-            {
-                name: "create_label",
-                description: "Creates a new Gmail label",
-                inputSchema: zodToJsonSchema(CreateLabelSchema),
-            },
-            {
-                name: "update_label",
-                description: "Updates an existing Gmail label",
-                inputSchema: zodToJsonSchema(UpdateLabelSchema),
-            },
-            {
-                name: "delete_label",
-                description: "Deletes a Gmail label",
-                inputSchema: zodToJsonSchema(DeleteLabelSchema),
-            },
-            {
-                name: "get_or_create_label",
-                description: "Gets an existing label by name or creates it if it doesn't exist",
-                inputSchema: zodToJsonSchema(GetOrCreateLabelSchema),
-            },
-        ],
-    }))
+    const app = express();
+    app.use(express.json());
 
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const { name, arguments: args } = request.params;
+    const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
+    const sseTransports: { [sessionId: string]: SSEServerTransport } = {};
 
-        async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
-            const message = createEmailMessage(validatedArgs);
+    // ========== Streamable Transport endpoint ==========
+    // Handle POST requests for client-to-server communication
+    app.post('/mcp', async (req, res) => {
+        // Check for existing session ID
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        let transport: StreamableHTTPServerTransport;
 
-            const encodedMessage = Buffer.from(message).toString('base64')
-                .replace(/\+/g, '-')
-                .replace(/\//g, '_')
-                .replace(/=+$/, '');
-
-            // Define the type for messageRequest
-            interface GmailMessageRequest {
-                raw: string;
-                threadId?: string;
-            }
-
-            const messageRequest: GmailMessageRequest = {
-                raw: encodedMessage,
-            };
-
-            // Add threadId if specified
-            if (validatedArgs.threadId) {
-                messageRequest.threadId = validatedArgs.threadId;
-            }
-
-            if (action === "send") {
-                const response = await gmail.users.messages.send({
-                    userId: 'me',
-                    requestBody: messageRequest,
-                });
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Email sent successfully with ID: ${response.data.id}`,
-                        },
-                    ],
-                };
-            } else {
-                const response = await gmail.users.drafts.create({
-                    userId: 'me',
-                    requestBody: {
-                        message: messageRequest,
-                    },
-                });
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Email draft created successfully with ID: ${response.data.id}`,
-                        },
-                    ],
-                };
-            }
-        }
-
-        // Helper function to process operations in batches
-        async function processBatches<T, U>(
-            items: T[],
-            batchSize: number,
-            processFn: (batch: T[]) => Promise<U[]>
-        ): Promise<{ successes: U[], failures: { item: T, error: Error }[] }> {
-            const successes: U[] = [];
-            const failures: { item: T, error: Error }[] = [];
-            
-            // Process in batches
-            for (let i = 0; i < items.length; i += batchSize) {
-                const batch = items.slice(i, i + batchSize);
-                try {
-                    const results = await processFn(batch);
-                    successes.push(...results);
-                } catch (error) {
-                    // If batch fails, try individual items
-                    for (const item of batch) {
-                        try {
-                            const result = await processFn([item]);
-                            successes.push(...result);
-                        } catch (itemError) {
-                            failures.push({ item, error: itemError as Error });
-                        }
-                    }
+        if (sessionId && transports[sessionId]) {
+            // Reuse existing transport
+            transport = transports[sessionId];
+        } else if (!sessionId && isInitializeRequest(req.body)) {
+            // New initialization request
+            transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => randomUUID(),
+                onsessioninitialized: (sessionId) => {
+                    // Store the transport by session ID
+                    transports[sessionId] = transport;
                 }
-            }
-            
-            return { successes, failures };
+            });
+
+            // Clean up transport when closed
+            transport.onclose = () => {
+                if (transport.sessionId) {
+                    delete transports[transport.sessionId];
+                }
+            };
+            const server = new McpServer({
+                name: "example-server",
+                version: "1.0.0"
+            });
+
+            registerGmailTools(server, gmail);
+
+            // Connect to the MCP server
+            await server.connect(transport);
+        } else {
+            // Invalid request
+            res.status(400).json({
+                jsonrpc: '2.0',
+                error: {
+                    code: -32000,
+                    message: 'Bad Request: No valid session ID provided',
+                },
+                id: null,
+            });
+            return;
         }
 
+        // Handle the request
+        await transport.handleRequest(req, res, req.body);
+    });
+
+    // For notifications and clean shutdown
+    const handleSessionRequest = async (req: express.Request, res: express.Response) => {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        if (!sessionId || !transports[sessionId]) {
+            res.status(400).send('Invalid or missing session ID');
+            return;
+        }
+        const transport = transports[sessionId];
+        await transport.handleRequest(req, res);
+    };
+
+    app.get('/mcp', handleSessionRequest);
+    app.delete('/mcp', handleSessionRequest);
+
+
+    // ========== SSE Transport endpoint ==========
+    app.get('/sse', async (req, res) => {
+        // Generate or get session id (always use header if client reconnects)
+        const sessionId = (req.headers['mcp-session-id'] as string) || randomUUID();
+        console.log("GET /sse received", sessionId);
+        // We use the same endpoint for GET and POST:
+        const endpointPath = '/messages';
+        const nodeRes: http.ServerResponse = res as any; // Express Response is compatible
+
+        // Prevent duplicate sessions
+        if (sseTransports[sessionId]) {
+            res.status(400).send('Session already exists');
+            return;
+        }
+
+        // Instantiate transport
+        const transport = new SSEServerTransport(endpointPath, nodeRes);
+        sseTransports[sessionId] = transport;
+
+        transport.onclose = () => {
+            delete sseTransports[sessionId];
+        };
+
+        // Register MCP tools for this session
+        const server = new McpServer({
+            name: "gmail",
+            version: "1.0.0",
+            capabilities: { tools: {} },
+        });
+        registerGmailTools(server, gmail);
+
+        // Connect transport to server (starts SSE)
+        await server.connect(transport);
+
+        // End session if client closes connection
+        req.on('close', () => transport.close());
+    });
+
+    // SSE POST: Handles messages from client for existing sessions
+    app.post('/messages', async (req, res) => {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        console.log("POST /messages", { sessionId, body: req.body });
+        if (!sessionId || !sseTransports[sessionId]) {
+            res.status(400).json({
+                jsonrpc: '2.0',
+                error: {
+                    code: -32000,
+                    message: 'Bad Request: No valid session ID provided',
+                },
+                id: null,
+            });
+            return;
+        }
+        const transport = sseTransports[sessionId];
         try {
-            switch (name) {
-                case "send_email":
-                case "draft_email": {
-                    const validatedArgs = SendEmailSchema.parse(args);
-                    const action = name === "send_email" ? "send" : "draft";
-                    return await handleEmailAction(action, validatedArgs);
-                }
-
-                case "read_email": {
-                    const validatedArgs = ReadEmailSchema.parse(args);
-                    const response = await gmail.users.messages.get({
-                        userId: 'me',
-                        id: validatedArgs.messageId,
-                        format: 'full',
-                    });
-
-                    const headers = response.data.payload?.headers || [];
-                    const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
-                    const from = headers.find(h => h.name?.toLowerCase() === 'from')?.value || '';
-                    const to = headers.find(h => h.name?.toLowerCase() === 'to')?.value || '';
-                    const date = headers.find(h => h.name?.toLowerCase() === 'date')?.value || '';
-                    const threadId = response.data.threadId || '';
-
-                    // Extract email content using the recursive function
-                    const { text, html } = extractEmailContent(response.data.payload as GmailMessagePart || {});
-
-                    // Use plain text content if available, otherwise use HTML content
-                    // (optionally, you could implement HTML-to-text conversion here)
-                    let body = text || html || '';
-
-                    // If we only have HTML content, add a note for the user
-                    const contentTypeNote = !text && html ?
-                        '[Note: This email is HTML-formatted. Plain text version not available.]\n\n' : '';
-
-                    // Get attachment information
-                    const attachments: EmailAttachment[] = [];
-                    const processAttachmentParts = (part: GmailMessagePart, path: string = '') => {
-                        if (part.body && part.body.attachmentId) {
-                            const filename = part.filename || `attachment-${part.body.attachmentId}`;
-                            attachments.push({
-                                id: part.body.attachmentId,
-                                filename: filename,
-                                mimeType: part.mimeType || 'application/octet-stream',
-                                size: part.body.size || 0
-                            });
-                        }
-
-                        if (part.parts) {
-                            part.parts.forEach((subpart: GmailMessagePart) =>
-                                processAttachmentParts(subpart, `${path}/parts`)
-                            );
-                        }
-                    };
-
-                    if (response.data.payload) {
-                        processAttachmentParts(response.data.payload as GmailMessagePart);
-                    }
-
-                    // Add attachment info to output if any are present
-                    const attachmentInfo = attachments.length > 0 ?
-                        `\n\nAttachments (${attachments.length}):\n` +
-                        attachments.map(a => `- ${a.filename} (${a.mimeType}, ${Math.round(a.size/1024)} KB)`).join('\n') : '';
-
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: `Thread ID: ${threadId}\nSubject: ${subject}\nFrom: ${from}\nTo: ${to}\nDate: ${date}\n\n${contentTypeNote}${body}${attachmentInfo}`,
-                            },
-                        ],
-                    };
-                }
-
-                case "search_emails": {
-                    const validatedArgs = SearchEmailsSchema.parse(args);
-                    const response = await gmail.users.messages.list({
-                        userId: 'me',
-                        q: validatedArgs.query,
-                        maxResults: validatedArgs.maxResults || 10,
-                    });
-
-                    const messages = response.data.messages || [];
-                    const results = await Promise.all(
-                        messages.map(async (msg) => {
-                            const detail = await gmail.users.messages.get({
-                                userId: 'me',
-                                id: msg.id!,
-                                format: 'metadata',
-                                metadataHeaders: ['Subject', 'From', 'Date'],
-                            });
-                            const headers = detail.data.payload?.headers || [];
-                            return {
-                                id: msg.id,
-                                subject: headers.find(h => h.name === 'Subject')?.value || '',
-                                from: headers.find(h => h.name === 'From')?.value || '',
-                                date: headers.find(h => h.name === 'Date')?.value || '',
-                            };
-                        })
-                    );
-
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: results.map(r =>
-                                    `ID: ${r.id}\nSubject: ${r.subject}\nFrom: ${r.from}\nDate: ${r.date}\n`
-                                ).join('\n'),
-                            },
-                        ],
-                    };
-                }
-
-                // Updated implementation for the modify_email handler
-                case "modify_email": {
-                    const validatedArgs = ModifyEmailSchema.parse(args);
-                    
-                    // Prepare request body
-                    const requestBody: any = {};
-                    
-                    if (validatedArgs.labelIds) {
-                        requestBody.addLabelIds = validatedArgs.labelIds;
-                    }
-                    
-                    if (validatedArgs.addLabelIds) {
-                        requestBody.addLabelIds = validatedArgs.addLabelIds;
-                    }
-                    
-                    if (validatedArgs.removeLabelIds) {
-                        requestBody.removeLabelIds = validatedArgs.removeLabelIds;
-                    }
-                    
-                    await gmail.users.messages.modify({
-                        userId: 'me',
-                        id: validatedArgs.messageId,
-                        requestBody: requestBody,
-                    });
-
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: `Email ${validatedArgs.messageId} labels updated successfully`,
-                            },
-                        ],
-                    };
-                }
-
-                case "delete_email": {
-                    const validatedArgs = DeleteEmailSchema.parse(args);
-                    await gmail.users.messages.delete({
-                        userId: 'me',
-                        id: validatedArgs.messageId,
-                    });
-
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: `Email ${validatedArgs.messageId} deleted successfully`,
-                            },
-                        ],
-                    };
-                }
-
-                case "list_email_labels": {
-                    const labelResults = await listLabels(gmail);
-                    const systemLabels = labelResults.system;
-                    const userLabels = labelResults.user;
-
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: `Found ${labelResults.count.total} labels (${labelResults.count.system} system, ${labelResults.count.user} user):\n\n` +
-                                    "System Labels:\n" +
-                                    systemLabels.map((l: GmailLabel) => `ID: ${l.id}\nName: ${l.name}\n`).join('\n') +
-                                    "\nUser Labels:\n" +
-                                    userLabels.map((l: GmailLabel) => `ID: ${l.id}\nName: ${l.name}\n`).join('\n')
-                            },
-                        ],
-                    };
-                }
-
-                case "batch_modify_emails": {
-                    const validatedArgs = BatchModifyEmailsSchema.parse(args);
-                    const messageIds = validatedArgs.messageIds;
-                    const batchSize = validatedArgs.batchSize || 50;
-                    
-                    // Prepare request body
-                    const requestBody: any = {};
-                    
-                    if (validatedArgs.addLabelIds) {
-                        requestBody.addLabelIds = validatedArgs.addLabelIds;
-                    }
-                    
-                    if (validatedArgs.removeLabelIds) {
-                        requestBody.removeLabelIds = validatedArgs.removeLabelIds;
-                    }
-
-                    // Process messages in batches
-                    const { successes, failures } = await processBatches(
-                        messageIds,
-                        batchSize,
-                        async (batch) => {
-                            const results = await Promise.all(
-                                batch.map(async (messageId) => {
-                                    const result = await gmail.users.messages.modify({
-                                        userId: 'me',
-                                        id: messageId,
-                                        requestBody: requestBody,
-                                    });
-                                    return { messageId, success: true };
-                                })
-                            );
-                            return results;
-                        }
-                    );
-
-                    // Generate summary of the operation
-                    const successCount = successes.length;
-                    const failureCount = failures.length;
-                    
-                    let resultText = `Batch label modification complete.\n`;
-                    resultText += `Successfully processed: ${successCount} messages\n`;
-                    
-                    if (failureCount > 0) {
-                        resultText += `Failed to process: ${failureCount} messages\n\n`;
-                        resultText += `Failed message IDs:\n`;
-                        resultText += failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${f.error.message})`).join('\n');
-                    }
-
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: resultText,
-                            },
-                        ],
-                    };
-                }
-
-                case "batch_delete_emails": {
-                    const validatedArgs = BatchDeleteEmailsSchema.parse(args);
-                    const messageIds = validatedArgs.messageIds;
-                    const batchSize = validatedArgs.batchSize || 50;
-
-                    // Process messages in batches
-                    const { successes, failures } = await processBatches(
-                        messageIds,
-                        batchSize,
-                        async (batch) => {
-                            const results = await Promise.all(
-                                batch.map(async (messageId) => {
-                                    await gmail.users.messages.delete({
-                                        userId: 'me',
-                                        id: messageId,
-                                    });
-                                    return { messageId, success: true };
-                                })
-                            );
-                            return results;
-                        }
-                    );
-
-                    // Generate summary of the operation
-                    const successCount = successes.length;
-                    const failureCount = failures.length;
-                    
-                    let resultText = `Batch delete operation complete.\n`;
-                    resultText += `Successfully deleted: ${successCount} messages\n`;
-                    
-                    if (failureCount > 0) {
-                        resultText += `Failed to delete: ${failureCount} messages\n\n`;
-                        resultText += `Failed message IDs:\n`;
-                        resultText += failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${f.error.message})`).join('\n');
-                    }
-
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: resultText,
-                            },
-                        ],
-                    };
-                }
-
-                // New label management handlers
-                case "create_label": {
-                    const validatedArgs = CreateLabelSchema.parse(args);
-                    const result = await createLabel(gmail, validatedArgs.name, {
-                        messageListVisibility: validatedArgs.messageListVisibility,
-                        labelListVisibility: validatedArgs.labelListVisibility,
-                    });
-
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: `Label created successfully:\nID: ${result.id}\nName: ${result.name}\nType: ${result.type}`,
-                            },
-                        ],
-                    };
-                }
-
-                case "update_label": {
-                    const validatedArgs = UpdateLabelSchema.parse(args);
-                    
-                    // Prepare request body with only the fields that were provided
-                    const updates: any = {};
-                    if (validatedArgs.name) updates.name = validatedArgs.name;
-                    if (validatedArgs.messageListVisibility) updates.messageListVisibility = validatedArgs.messageListVisibility;
-                    if (validatedArgs.labelListVisibility) updates.labelListVisibility = validatedArgs.labelListVisibility;
-                    
-                    const result = await updateLabel(gmail, validatedArgs.id, updates);
-
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: `Label updated successfully:\nID: ${result.id}\nName: ${result.name}\nType: ${result.type}`,
-                            },
-                        ],
-                    };
-                }
-
-                case "delete_label": {
-                    const validatedArgs = DeleteLabelSchema.parse(args);
-                    const result = await deleteLabel(gmail, validatedArgs.id);
-
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: result.message,
-                            },
-                        ],
-                    };
-                }
-
-                case "get_or_create_label": {
-                    const validatedArgs = GetOrCreateLabelSchema.parse(args);
-                    const result = await getOrCreateLabel(gmail, validatedArgs.name, {
-                        messageListVisibility: validatedArgs.messageListVisibility,
-                        labelListVisibility: validatedArgs.labelListVisibility,
-                    });
-
-                    const action = result.type === 'user' && result.name === validatedArgs.name ? 'found existing' : 'created new';
-                    
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: `Successfully ${action} label:\nID: ${result.id}\nName: ${result.name}\nType: ${result.type}`,
-                            },
-                        ],
-                    };
-                }
-
-                default:
-                    throw new Error(`Unknown tool: ${name}`);
-            }
-        } catch (error: any) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Error: ${error.message}`,
-                    },
-                ],
-            };
+            console.log("Handling POST for session", sessionId, req.body);
+            await transport.handlePostMessage(req as any, res as any, req.body);
+            console.log("POST handled");
+        } catch (err) {
+            console.error("Error handling POST:", err);
+            if (!res.headersSent)
+                res.status(500).json({ error: (err as Error).message });
         }
     });
 
-    const transport = new StdioServerTransport();
-    server.connect(transport);
+    // Optional (but usually unused): SSE DELETE handler to trigger session close
+    app.delete('/sse', async (req, res) => {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        if (!sessionId || !sseTransports[sessionId]) {
+            res.status(400).send('Invalid or missing session ID');
+            return;
+        }
+        await sseTransports[sessionId].close();
+        res.status(204).end();
+    });
+
+
+    app.listen(3000, () => {
+        console.log('Gmail MCP HTTP/SSE server running at http://localhost:3000');
+    });
 }
 
 main().catch((error) => {
